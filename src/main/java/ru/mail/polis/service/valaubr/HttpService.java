@@ -2,7 +2,16 @@ package ru.mail.polis.service.valaubr;
 
 import com.google.common.base.Charsets;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import one.nio.http.*;
+import one.nio.http.HttpClient;
+import one.nio.http.HttpException;
+import one.nio.http.HttpServer;
+import one.nio.http.HttpServerConfig;
+import one.nio.http.HttpSession;
+import one.nio.http.Param;
+import one.nio.http.Path;
+import one.nio.http.Request;
+import one.nio.http.RequestMethod;
+import one.nio.http.Response;
 import one.nio.net.ConnectionString;
 import one.nio.server.AcceptorConfig;
 import org.jetbrains.annotations.NotNull;
@@ -62,7 +71,8 @@ public class HttpService extends HttpServer implements Service {
         this.executor = new ThreadPoolExecutor(
                 threadPool,
                 queueSize,
-                0L, TimeUnit.MILLISECONDS,
+                0L,
+                TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueSize),
                 new ThreadFactoryBuilder()
                         .setNameFormat("Worker-%d")
@@ -126,28 +136,21 @@ public class HttpService extends HttpServer implements Service {
         executor.execute(() -> {
             final ByteBuffer key = ByteBuffer.wrap(id.getBytes(Charsets.UTF_8));
             final String node = topology.primaryFor(key);
-            if (topology.isMe(node)) {
+            if (topology.isMe(node)) try {
+                session.sendResponse(Response.ok(
+                        converterFromByteBuffer(dao.get(key))));
+            } catch (NoSuchElementException e) {
+                logger.error("Record not exist by id = {}", id);
                 try {
-                    session.sendResponse(Response.ok(
-                            converterFromByteBuffer(dao.get(key))));
-                } catch (NoSuchElementException e) {
-                    logger.error("Record not exist by id = {}", id);
-                    try {
-                        session.sendResponse(new Response(Response.NOT_FOUND, Response.EMPTY));
-                    } catch (IOException ioException) {
-                        logger.error("Record not exist && response is dropped: " + ioException);
-                    }
-                } catch (IOException e) {
-                    logger.error("Error when getting record", e);
-                    try {
-                        session.sendResponse(new Response(Response.INTERNAL_ERROR, Response.EMPTY));
-                    } catch (IOException ioException) {
-                        logger.error("Error when getting record && response is dropped: ", ioException);
-                    }
+                    session.sendResponse(new Response(Response.NOT_FOUND, Response.EMPTY));
+                } catch (IOException ioException) {
+                    logger.error("Record not exist && response is dropped: " + ioException);
                 }
-            } else {
-                proxy(node, request, session);
+            } catch (IOException e) {
+                logger.error("Error when getting record", e);
+                messageOfInternalError(session, "Error when getting record && response is dropped: ");
             }
+            else proxy(node, request, session);
         });
     }
 
@@ -174,11 +177,7 @@ public class HttpService extends HttpServer implements Service {
                     session.sendResponse(new Response(Response.CREATED, Response.EMPTY));
                 } catch (IOException e) {
                     logger.error("Error when putting record", e);
-                    try {
-                        session.sendResponse(new Response(Response.INTERNAL_ERROR, Response.EMPTY));
-                    } catch (IOException ioException) {
-                        logger.error("Put error && response is dropped:", ioException);
-                    }
+                    messageOfInternalError(session, "Put error && response is dropped:");
                 }
             } else {
                 proxy(node, request, session);
@@ -210,11 +209,7 @@ public class HttpService extends HttpServer implements Service {
                     session.sendResponse(new Response(Response.ACCEPTED, Response.EMPTY));
                 } catch (IOException e) {
                     logger.error("Error when deleting record", e);
-                    try {
-                        session.sendResponse(new Response(Response.INTERNAL_ERROR, Response.EMPTY));
-                    } catch (IOException ioException) {
-                        logger.error("Error when deleting record && response is dropped", e);
-                    }
+                    messageOfInternalError(session, "Error when deleting record && response is dropped");
                 }
             } else {
                 proxy(node, request, session);
@@ -222,17 +217,19 @@ public class HttpService extends HttpServer implements Service {
         });
     }
 
-    private void proxy(@NotNull String node,
-                       @NotNull Request request,
-                       @NotNull HttpSession session) {
+    private void proxy(@NotNull final String node,
+                       @NotNull final Request request,
+                       @NotNull final HttpSession session) {
         try {
+            request.addHeader("X-Proxy-For: " + node);
             session.sendResponse(nodeToClient.get(node).invoke(request));
-        } catch (Exception e) {
+        } catch (IOException | InterruptedException | PoolException | HttpException e) {
             logger.error("Can`t proxy request: ", e);
+            messageOfInternalError(session, "Socket go to sleep");
         }
     }
 
-    private boolean checkId(String id, HttpSession session) {
+    private boolean checkId(@NotNull final String id, @NotNull final HttpSession session) {
         if (id.strip().isEmpty()) {
             try {
                 session.sendResponse(new Response(Response.BAD_REQUEST, Response.EMPTY));
@@ -245,9 +242,17 @@ public class HttpService extends HttpServer implements Service {
         return false;
     }
 
+    private void messageOfInternalError(@NotNull final HttpSession session,
+                                        @NotNull final String message) {
+        try {
+            session.sendResponse(new Response(Response.INTERNAL_ERROR, Response.EMPTY));
+        } catch (IOException ioException) {
+            logger.error(message, ioException);
+        }
+    }
+
     @Override
-    public void handleDefault(@NotNull final Request request, @NotNull final HttpSession session) throws
-            IOException {
+    public void handleDefault(@NotNull final Request request, @NotNull final HttpSession session) {
         executor.execute(() -> {
             try {
                 session.sendResponse(new Response(Response.BAD_REQUEST, Response.EMPTY));
