@@ -4,7 +4,6 @@ import com.google.common.base.Charsets;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import one.nio.http.*;
 import one.nio.net.ConnectionString;
-import one.nio.pool.PoolException;
 import one.nio.server.AcceptorConfig;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -19,7 +18,10 @@ import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.NoSuchElementException;
-import java.util.concurrent.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 public class HttpService extends HttpServer implements Service {
     private static final String UNIVERSAL_MESSAGE = "Empty id && response is dropped";
