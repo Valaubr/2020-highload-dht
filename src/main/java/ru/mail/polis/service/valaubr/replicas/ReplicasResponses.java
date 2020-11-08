@@ -4,85 +4,50 @@ import one.nio.http.Response;
 
 import java.util.List;
 
-public class Consensus {
+public class ReplicasResponses {
     private static final String NOT_ENOUGH_REPLICAS = "504 Not Enough Replicas";
+    private static final int CREATED = 201;
+    private static final int ACCEPTED = 202;
+    private static final int NOT_FOUND = 404;
+    private static final int OK = 200;
 
-    private Consensus() {
-    }
-
-    /**
-     * Resolves conflicts among responses received from a GET request.
-     *
-     * @param responses - list of all responses
-     * @param ack       - ack
-     * @return resulting response
-     */
-    public static Response get(final List<Response> responses, final int ack) {
+    public static Response get(final List<Response> responses, final Pair ackFrom) {
+        Response outputValue = new Response(Response.NOT_FOUND, Response.EMPTY);
         int count = 0;
-        int count404 = 0;
-        boolean isDeleted = false;
-        Response okValue = new Response(Response.NOT_FOUND, Response.EMPTY);
+        long currentTimeStamp = 0L;
+        long tmpTimeStamp = 0L;
         for (final Response response : responses) {
-            final int status = response.getStatus();
-            if (status == 200) {
-                count++;
-                if (Boolean.parseBoolean(response.getHeader("isTombstone"))) {
-                    isDeleted = true;
-                    continue;
-                }
-                okValue = response;
-            } else if (status == 404) {
-                count404++;
-                count++;
+            switch (response.getStatus()) {
+                case OK:
+                    count++;
+                    if (response.getHeader("TimeStamp") != null) {
+                        tmpTimeStamp = Long.parseLong(response.getHeader("TimeStamp"));
+                        if (currentTimeStamp < tmpTimeStamp) {
+                            outputValue = response;
+                            currentTimeStamp = tmpTimeStamp;
+                        }
+                    }
+                    break;
+                case NOT_FOUND:
+                    count++;
+                    break;
             }
         }
-        if (count >= ack) {
-            if (isDeleted || count == count404) {
-                return new Response(Response.NOT_FOUND, Response.EMPTY);
-            } else {
-                return Response.ok(okValue.getBody());
-            }
+        if (count >= ackFrom.getAck()) {
+            if (outputValue.getHeader("TOMBSTONE") != null) return new Response(Response.NOT_FOUND, Response.EMPTY);
+            else return outputValue;
         } else {
             return new Response(NOT_ENOUGH_REPLICAS, Response.EMPTY);
         }
     }
 
-    /**
-     * Resolves conflicts among responses received from a PUT request.
-     *
-     * @param responses - list of all responses
-     * @param ack       - ack
-     * @return resulting response
-     */
-    public static Response put(final List<Response> responses, final int ack) {
-        return simpleResponse(responses, ack, 201, Response.CREATED);
+    public static Response put(final List<Response> responses, final Pair ackFrom) {
+        int ackCount = (int) responses.stream().filter(response -> response.getStatus() == CREATED).count();
+        return ackCount >= ackFrom.getAck() ? new Response(Response.CREATED, Response.EMPTY) : new Response(NOT_ENOUGH_REPLICAS, Response.EMPTY);
     }
 
-    /**
-     * Resolves conflicts among responses received from a DELETE request.
-     *
-     * @param responses - list of all responses
-     * @param ack       - ack
-     * @return resulting response
-     */
-    public static Response delete(final List<Response> responses, final int ack) {
-        return simpleResponse(responses, ack, 202, Response.ACCEPTED);
-    }
-
-    private static Response simpleResponse(final List<Response> responses,
-                                           final int ack,
-                                           final int status,
-                                           final String result) {
-        int ackCount = 0;
-        for (final Response response : responses) {
-            if (response.getStatus() == status) {
-                ackCount++;
-            }
-        }
-        if (ackCount >= ack) {
-            return new Response(result, Response.EMPTY);
-        } else {
-            return new Response(NOT_ENOUGH_REPLICAS, Response.EMPTY);
-        }
+    public static Response delete(final List<Response> responses, final Pair ackFrom) {
+        int ackCount = (int) responses.stream().filter(response -> response.getStatus() == ACCEPTED).count();
+        return ackCount >= ackFrom.getAck() ? new Response(Response.ACCEPTED, Response.EMPTY) : new Response(NOT_ENOUGH_REPLICAS, Response.EMPTY);
     }
 }

@@ -1,15 +1,19 @@
 package ru.mail.polis.service.valaubr.replicas;
 
-public class AckFromPair {
+import com.google.common.base.Splitter;
+
+import java.util.List;
+
+public class Pair {
     private final int ack;
     private final int from;
 
-    public AckFromPair(int ack, int from) {
+    public Pair(int ack, int from) {
         this.ack = ack;
         this.from = from;
     }
 
-    public static AckFromPair setAckFrom(String replicas, int size) {
+    public static Pair setAckFrom(String replicas, int size) {
         int tmpAck;
         int tmpFrom;
         if (replicas == null) {
@@ -21,15 +25,15 @@ public class AckFromPair {
             } else {
                 tmpAck = 2;
             }
-            return new AckFromPair(tmpAck, tmpFrom);
+            return new Pair(tmpAck, tmpFrom);
         } else {
-            String[] values = replicas.split("/");
-            tmpAck = Integer.parseInt(values[0]);
-            tmpFrom = Integer.parseInt(values[1]);
-            if (Integer.parseInt(values[0]) <= Integer.parseInt(values[1])) {
-                return new AckFromPair(tmpAck, tmpFrom);
+            List<String> values = Splitter.on('/').splitToList(replicas);
+            tmpAck = Integer.parseInt(values.get(0));
+            tmpFrom = Integer.parseInt(values.get(1));
+            if (tmpAck <= tmpFrom && tmpAck > 0) {
+                return new Pair(tmpAck, tmpFrom);
             } else {
-                throw new IllegalArgumentException("Incorrect replica parameter");
+                return null;
             }
         }
     }

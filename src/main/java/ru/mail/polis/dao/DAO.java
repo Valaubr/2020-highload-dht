@@ -19,6 +19,7 @@ package ru.mail.polis.dao;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import ru.mail.polis.Record;
+import ru.mail.polis.dao.valaubr.Cell;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -84,6 +85,13 @@ public interface DAO extends Closeable {
             throw new NoSuchElementException("Not found");
         }
     }
+
+    /**
+     * Getting cell, if we need timestamp and check value.
+     * @return Cell - cell with time and data
+     */
+    @NotNull
+    Cell getCell(@NotNull final ByteBuffer key) throws NoSuchElementException;
 
     /**
      * Inserts or updates value by given key.

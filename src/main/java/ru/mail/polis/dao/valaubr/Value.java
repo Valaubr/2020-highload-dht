@@ -20,16 +20,16 @@ public class Value implements Comparable<Value> {
         this.data = null;
     }
 
-    boolean isTombstone() {
+    public boolean isTombstone() {
         return data == null;
     }
 
-    ByteBuffer getData() {
-        assert !isTombstone();
-        return data.asReadOnlyBuffer();
+    public ByteBuffer getData() {
+        //assert !isTombstone();
+        return data != null ? data.asReadOnlyBuffer() : null;
     }
 
-    long getTimestamp() {
+    public long getTimestamp() {
         return timestamp;
     }
 

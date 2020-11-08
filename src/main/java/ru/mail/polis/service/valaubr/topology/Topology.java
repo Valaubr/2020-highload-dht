@@ -3,6 +3,7 @@ package ru.mail.polis.service.valaubr.topology;
 import org.jetbrains.annotations.NotNull;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 
 public interface Topology<N> {
     @NotNull
@@ -11,7 +12,10 @@ public interface Topology<N> {
     boolean isMe(@NotNull final String node);
 
     @NotNull
-    N[] all();
+    List<String> all();
+
+    @NotNull
+    List<String> ackServers(int from, ByteBuffer key);
 
     int size();
 }

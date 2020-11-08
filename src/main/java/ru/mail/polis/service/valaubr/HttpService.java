@@ -10,25 +10,28 @@ import one.nio.http.HttpSession;
 import one.nio.http.Param;
 import one.nio.http.Path;
 import one.nio.http.Request;
-import one.nio.http.RequestMethod;
 import one.nio.http.Response;
 import one.nio.net.ConnectionString;
+import one.nio.pool.PoolException;
 import one.nio.server.AcceptorConfig;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.mail.polis.dao.DAO;
+import ru.mail.polis.dao.valaubr.Cell;
+import ru.mail.polis.dao.valaubr.Value;
 import ru.mail.polis.service.Service;
+import ru.mail.polis.service.valaubr.replicas.Pair;
+import ru.mail.polis.service.valaubr.replicas.ReplicasResponses;
 import ru.mail.polis.service.valaubr.topology.ModularTopology;
 import ru.mail.polis.service.valaubr.topology.Topology;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.NoSuchElementException;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -80,7 +83,6 @@ public class HttpService extends HttpServer implements Service {
                         .build(),
                 new ThreadPoolExecutor.AbortPolicy()
         );
-
     }
 
     private static HttpServerConfig config(final int port, final int threadPool) {
@@ -116,43 +118,6 @@ public class HttpService extends HttpServer implements Service {
         return Response.ok(Response.OK);
     }
 
-    /**
-     * Getting Entity by id.
-     *
-     * @param id - Entity id
-     *           200 - ok
-     *           400 - Empty id in param
-     *           404 - No such element in dao
-     *           500 - Internal error
-     */
-    @Path("/v0/entity")
-    @RequestMethod(Request.METHOD_GET)
-    public void get(@Param(required = true, value = "id") @NotNull final String id,
-                    @NotNull final HttpSession session,
-                    @NotNull final Request request) {
-        if (checkId(id, session)) {
-            return;
-        }
-        executor.execute(() -> {
-            final ByteBuffer key = ByteBuffer.wrap(id.getBytes(Charsets.UTF_8));
-            final String node = topology.primaryFor(key);
-            if (topology.isMe(node)) try {
-                session.sendResponse(Response.ok(
-                        converterFromByteBuffer(dao.get(key))));
-            } catch (NoSuchElementException e) {
-                logger.error("Record not exist by id = {}", id);
-                try {
-                    session.sendResponse(new Response(Response.NOT_FOUND, Response.EMPTY));
-                } catch (IOException ioException) {
-                    logger.error("Record not exist && response is dropped: " + ioException);
-                }
-            } catch (IOException e) {
-                logger.error("Error when getting record", e);
-                messageOfInternalError(session, "Error when getting record && response is dropped: ");
-            }
-            else proxy(node, request, session);
-        });
-    }
 
     /**
      * Insertion entity dao by id.
@@ -163,69 +128,162 @@ public class HttpService extends HttpServer implements Service {
      *           500 - Internal error
      */
     @Path("/v0/entity")
-    @RequestMethod(Request.METHOD_PUT)
-    public void put(@Param(required = true, value = "id") @NotNull final String id,
-                    @NotNull final Request request, @NotNull final HttpSession session) {
-        if (checkId(id, session)) {
-            return;
-        }
-        executor.execute(() -> {
-            final String node = topology.primaryFor(ByteBuffer.wrap(id.getBytes(Charsets.UTF_8)));
-            if (topology.isMe(node)) {
-                try {
-                    dao.upsert(ByteBuffer.wrap(id.getBytes(Charsets.UTF_8)), ByteBuffer.wrap(request.getBody()));
-                    session.sendResponse(new Response(Response.CREATED, Response.EMPTY));
-                } catch (IOException e) {
-                    logger.error("Error when putting record", e);
-                    messageOfInternalError(session, "Put error && response is dropped:");
+    public void entity(@Param(required = true, value = "id") @NotNull final String id,
+                       @NotNull final Request request,
+                       @NotNull final HttpSession session,
+                       @Param(value = "replicas") @NotNull String replicas) {
+        if (checkId(id, session)) return;
+        try {
+            executor.execute(() -> {
+                final ByteBuffer key = ByteBuffer.wrap(id.getBytes(Charsets.UTF_8));
+                if (request.getHeader("X-Replicas-Finding") != null) {
+                    findReplicasParam(request, session, key);
+                } else {
+                    connectToAllReplicas(session, request, replicas, key);
                 }
+            });
+        } catch (RejectedExecutionException e) {
+            logger.error("Server can`t sending response", e);
+        }
+    }
+
+    private void findReplicasParam(@NotNull final Request request,
+                                   @NotNull final HttpSession session,
+                                   @NotNull final ByteBuffer key) {
+        try {
+            switch (request.getMethod()) {
+                case Request.METHOD_GET:
+                    session.sendResponse(get(key));
+                    break;
+                case Request.METHOD_PUT:
+                    session.sendResponse(put(request, key));
+                    break;
+                case Request.METHOD_DELETE:
+                    session.sendResponse(delete(key));
+                    break;
+            }
+        } catch (IOException ioException) {
+            logger.error("Sending error", ioException);
+        }
+    }
+
+    private void connectToAllReplicas(@NotNull HttpSession session,
+                                      @NotNull Request request,
+                                      @NotNull String replicas,
+                                      @NotNull ByteBuffer key) {
+        request.addHeader("X-Replicas-Finding");
+        final Pair replicaParam = Pair.setAckFrom(replicas, topology.size());
+        if (replicaParam == null) {
+            logger.error("Ack/From illegal arguments");
+            try {
+                session.sendResponse(new Response(Response.BAD_REQUEST, Response.EMPTY));
+            } catch (IOException ioException) {
+                logger.error("Cant sending BAD_REQUEST", ioException);
+            }
+        }
+        final List<String> nodes = topology.ackServers(replicaParam.getFrom(), key);
+        final List<Response> responses;
+        final Response output;
+        try {
+            switch (request.getMethod()) {
+                case Request.METHOD_GET:
+                    responses = getResponses(nodes, get(key), request);
+                    output = ReplicasResponses.get(responses, replicaParam);
+                    session.sendResponse(output);
+                    break;
+                case Request.METHOD_PUT:
+                    responses = getResponses(nodes, put(request, key), request);
+                    output = ReplicasResponses.put(responses, replicaParam);
+                    session.sendResponse(output);
+                    break;
+                case Request.METHOD_DELETE:
+                    responses = getResponses(nodes, delete(key), request);
+                    output = ReplicasResponses.delete(responses, replicaParam);
+                    session.sendResponse(output);
+                    break;
+                default:
+                    break;
+            }
+        } catch (IOException ioException) {
+            logger.error("Can't send resulting response.", ioException);
+        }
+    }
+
+    private List<Response> getResponses(@NotNull final List<String> nodes,
+                                           @NotNull final Response response,
+                                           @NotNull final Request request) {
+        final List<Response> responses = new ArrayList<>();
+        nodes.forEach(node -> {
+            if (topology.isMe(node)) {
+                responses.add(response);
             } else {
-                proxy(node, request, session);
+                responses.add(proxy(node, request));
             }
         });
+        return responses;
+    }
+
+    /**
+     * Getting Entity by id.
+     * <p>
+     * 200 - ok
+     * 400 - Empty id in param
+     * 404 - No such element in dao
+     * 500 - Internal error
+     */
+    @NotNull
+    private Response get(@NotNull final ByteBuffer key) {
+        try {
+            final Value value = dao.getCell(key).getValue();
+            Response response;
+            if (value.isTombstone()){
+                response = new Response(Response.OK, Response.EMPTY);
+                response.addHeader("TOMBSTONE");
+            } else {
+                response = new Response(Response.OK, converterFromByteBuffer(value.getData()));
+            }
+            response.addHeader("TimeStamp" + value.getTimestamp());
+            return response;
+        } catch (NoSuchElementException e) {
+            logger.error("Record not exist by id = {}", key);
+            Response output = new Response(Response.NOT_FOUND, Response.EMPTY);
+            return output;
+        }
+    }
+
+    private Response put(@NotNull final Request request,
+                         @NotNull final ByteBuffer key) {
+        try {
+            dao.upsert(key, ByteBuffer.wrap(request.getBody()));
+            return new Response(Response.CREATED, Response.EMPTY);
+        } catch (IOException e) {
+            logger.error("Error whet upsert or sending response:", e);
+            return new Response(Response.INTERNAL_ERROR, Response.EMPTY);
+        }
     }
 
     /**
      * Deleting entity from dao by id.
-     *
-     * @param id - Entity id
-     *           202 - Delete entity
-     *           400 - Empty id in param
-     *           500 - Internal error
      */
-    @Path("/v0/entity")
-    @RequestMethod(Request.METHOD_DELETE)
-    public void delete(@Param(required = true, value = "id") @NotNull final String id,
-                       @NotNull final HttpSession session,
-                       @NotNull final Request request) {
-        if (checkId(id, session)) {
-            return;
+
+    public Response delete(@NotNull final ByteBuffer key) {
+        try {
+            dao.remove(key);
+            return new Response(Response.ACCEPTED, Response.EMPTY);
+        } catch (IOException e) {
+            logger.error("Error when deleting record", e);
+            return new Response(Response.INTERNAL_ERROR, Response.EMPTY);
         }
-        executor.execute(() -> {
-            final String node = topology.primaryFor(ByteBuffer.wrap(id.getBytes(Charsets.UTF_8)));
-            if (topology.isMe(node)) {
-                try {
-                    dao.remove(ByteBuffer.wrap(id.getBytes(Charsets.UTF_8)));
-                    session.sendResponse(new Response(Response.ACCEPTED, Response.EMPTY));
-                } catch (IOException e) {
-                    logger.error("Error when deleting record", e);
-                    messageOfInternalError(session, "Error when deleting record && response is dropped");
-                }
-            } else {
-                proxy(node, request, session);
-            }
-        });
     }
 
-    private void proxy(@NotNull final String node,
-                       @NotNull final Request request,
-                       @NotNull final HttpSession session) {
+    private Response proxy(@NotNull final String node,
+                           @NotNull final Request request) {
         try {
-            request.addHeader("X-Proxy-For: " + node);
-            session.sendResponse(nodeToClient.get(node).invoke(request));
+            request.addHeader("X-Replicas-Finding: " + node);
+            return new Response(nodeToClient.get(node).invoke(request));
         } catch (IOException | InterruptedException | PoolException | HttpException e) {
             logger.error("Can`t proxy request: ", e);
-            messageOfInternalError(session, "Socket go to sleep");
+            return new Response(Response.INTERNAL_ERROR, Response.EMPTY);
         }
     }
 
@@ -242,24 +300,13 @@ public class HttpService extends HttpServer implements Service {
         return false;
     }
 
-    private void messageOfInternalError(@NotNull final HttpSession session,
-                                        @NotNull final String message) {
-        try {
-            session.sendResponse(new Response(Response.INTERNAL_ERROR, Response.EMPTY));
-        } catch (IOException ioException) {
-            logger.error(message, ioException);
-        }
-    }
-
     @Override
     public void handleDefault(@NotNull final Request request, @NotNull final HttpSession session) {
-        executor.execute(() -> {
-            try {
-                session.sendResponse(new Response(Response.BAD_REQUEST, Response.EMPTY));
-            } catch (IOException e) {
-                logger.error("handleDefault can`t send response", e);
-            }
-        });
+        try {
+            session.sendResponse(new Response(Response.BAD_REQUEST, Response.EMPTY));
+        } catch (IOException e) {
+            logger.error("handleDefault can`t send response", e);
+        }
     }
 
     @Override

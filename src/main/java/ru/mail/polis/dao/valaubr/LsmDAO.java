@@ -15,10 +15,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.NavigableMap;
+import java.util.*;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -51,7 +48,7 @@ public class LsmDAO implements DAO {
     private final Pattern pattern = Pattern.compile("^\\d+$");
     private final TablesPool memTablePool;
     private final ExecutorService executorService;
-    private final ReadWriteLock readWriteLock;
+    private final ReadWriteLock lock;
     private final Logger log = LoggerFactory.getLogger(LsmDAO.class);
     private final AtomicInteger generation = new AtomicInteger(0);
 
@@ -81,30 +78,31 @@ public class LsmDAO implements DAO {
                                 ssTables.put(gen, new SSTable(file.toFile()));
                             }
                         } catch (IOException e) {
-                            throw new UncheckedIOException(e);
+                            log.error("Error while reading file", e);
                         }
                     });
-            generation.addAndGet(1);
-            this.readWriteLock = new ReentrantReadWriteLock();
-            this.memTablePool = new TablesPool(flushThreshold, generation.addAndGet(1), POOL_SIZE);
-            this.executorService = Executors.newFixedThreadPool(NUMBER_OF_THREADS);
-            this.executorService.execute(this::flushingHelper);
         }
+        generation.addAndGet(1);
+        this.lock = new ReentrantReadWriteLock();
+        this.memTablePool = new TablesPool(flushThreshold, generation.addAndGet(1), POOL_SIZE);
+        this.executorService = Executors.newFixedThreadPool(NUMBER_OF_THREADS);
+        this.executorService.execute(this::flushingHelper);
     }
 
     @NotNull
     @Override
     public Iterator<Record> iterator(@NotNull final ByteBuffer from) {
-        readWriteLock.readLock().lock();
+        final Iterator<Cell> alive;
+        lock.readLock().lock();
         try {
-            final Iterator<Cell> alive = Iterators.filter(cellIterator(from),
+            alive = Iterators.filter(cellIterator(from),
                     cell -> !requireNonNull(cell).getValue().isTombstone());
-            return Iterators.transform(alive, cell ->
-                    Record.of(requireNonNull(cell).getKey(),
-                            cell.getValue().getData()));
         } finally {
-            readWriteLock.readLock().unlock();
+            lock.readLock().unlock();
         }
+        return Iterators.transform(alive, cell ->
+                Record.of(requireNonNull(cell).getKey(),
+                        cell.getValue().getData()));
     }
 
     private Iterator<Cell> cellIterator(@NotNull final ByteBuffer from) {
@@ -113,13 +111,12 @@ public class LsmDAO implements DAO {
             iters.add(memTablePool.iterator(from));
         } catch (IOException e) {
             log.error("Bad iterator from memTablePool:", e);
-            throw new UncheckedIOException(e);
         }
         ssTables.descendingMap().values().forEach(table -> {
             try {
                 iters.add(table.iterator(from));
             } catch (IOException e) {
-                throw new UncheckedIOException(e);
+                log.error("Bad iterator from ssTable:", e);
             }
         });
         final Iterator<Cell> merged = Iterators.mergeSorted(iters, Cell.COMPARATOR);
@@ -127,14 +124,30 @@ public class LsmDAO implements DAO {
         return Iters.collapseEquals(merged, Cell::getKey);
     }
 
+    @NotNull
+    @Override
+    public Cell getCell(@NotNull final ByteBuffer key) throws NoSuchElementException {
+        final Iterator<Cell> iter = cellIterator(key);
+        if (!iter.hasNext()) {
+            throw new NoSuchElementException("Not found");
+        }
+
+        final Cell next = iter.next();
+        if (next.getKey().equals(key)) {
+            return next;
+        } else {
+            throw new NoSuchElementException("Not found");
+        }
+    }
+
     @Override
     public void upsert(@NotNull final ByteBuffer key, @NotNull final ByteBuffer value) {
-        memTablePool.upsert(key, value.asReadOnlyBuffer());
+        memTablePool.upsert(key.asReadOnlyBuffer(), value.asReadOnlyBuffer());
     }
 
     @Override
     public void remove(@NotNull final ByteBuffer key) {
-        memTablePool.remove(key);
+        memTablePool.remove(key.asReadOnlyBuffer());
     }
 
     @Override
@@ -169,7 +182,7 @@ public class LsmDAO implements DAO {
     }
 
     private void flush(@NotNull final FlushingTable flushingTable) throws IOException {
-        readWriteLock.writeLock().lock();
+        lock.writeLock().lock();
         try {
             final File file = new File(storage, generation + TEMP_FILE_POSTFIX);
             file.createNewFile();
@@ -179,13 +192,13 @@ public class LsmDAO implements DAO {
             generation.addAndGet(1);
             ssTables.put(generation.get(), new SSTable(dst));
         } finally {
-            readWriteLock.writeLock().unlock();
+            lock.writeLock().unlock();
         }
     }
 
     @Override
     public void compact() throws IOException {
-        readWriteLock.writeLock().lock();
+        lock.writeLock().lock();
         try {
             final File tempFile = new File(storage, LSM_TEMP_FILE);
             tempFile.createNewFile();
@@ -206,7 +219,7 @@ public class LsmDAO implements DAO {
             ssTables.clear();
             ssTables.put(generation.addAndGet(1), new SSTable(dst));
         } finally {
-            readWriteLock.writeLock().unlock();
+            lock.writeLock().unlock();
         }
     }
 }

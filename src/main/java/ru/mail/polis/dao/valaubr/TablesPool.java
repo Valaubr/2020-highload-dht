@@ -33,8 +33,8 @@ public class TablesPool implements Table {
      * Pool of tables to multiThreading work.
      *
      * @param memFlushThreshold - size to flush
-     * @param startGeneration - first generation
-     * @param flushTablePool - flush pool size
+     * @param startGeneration   - first generation
+     * @param flushTablePool    - flush pool size
      */
     public TablesPool(final long memFlushThreshold, final int startGeneration, final int flushTablePool) {
         this.memFlushThreshold = memFlushThreshold;
@@ -62,8 +62,7 @@ public class TablesPool implements Table {
         final Iterator<Cell> withoutEquals = Iters.collapseEquals(merged, Cell::getKey);
         return Iterators.filter(withoutEquals,
                 cell -> {
-                    assert cell != null;
-                    return !cell.getValue().isTombstone();
+                    return true;
                 });
     }
 
@@ -83,7 +82,7 @@ public class TablesPool implements Table {
 
     @Override
     public int size() {
-        return 0;
+        return current.size();
     }
 
     @Override
@@ -149,16 +148,17 @@ public class TablesPool implements Table {
 
     private void putIntoFlushQueue() {
         FlushingTable tableToFlush = null;
-        lock.writeLock().lock();
-        try {
-            if (current.getSizeInBytes() > memFlushThreshold) {
+        if (current.getSizeInBytes() > memFlushThreshold) {
+            lock.writeLock().lock();
+            try {
                 tableToFlush = new FlushingTable(current, generation);
                 writingFlushTables.put(generation, current);
                 generation++;
                 current = new MemTable();
+
+            } finally {
+                lock.writeLock().unlock();
             }
-        } finally {
-            lock.writeLock().unlock();
         }
         if (tableToFlush != null) {
             try {
